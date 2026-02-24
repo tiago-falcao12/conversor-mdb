@@ -1,108 +1,105 @@
 import streamlit as st
-import jpype
-import jpype.imports
-from jpype.types import *
-import pandas as pd
-import os
-import glob
-import re
-import zipfile
+import subprocess
 import tempfile
-from pathlib import Path
+import os
+import zipfile
 
-# -----------------------
-# Função para path compatível com PyInstaller/Streamlit Cloud
-# -----------------------
-def resource_path(relative_path):
-    return os.path.join(os.path.dirname(__file__), relative_path)
+st.set_page_config(page_title="Conversor MDB para CSV", layout="centered")
+st.title("Conversor de Arquivos Microsoft Access (.mdb) para CSV")
+st.markdown("Faça upload de um arquivo .mdb e obtenha as tabelas em CSV.")
 
-# -----------------------
-# Inicia JVM com todos os jars na pasta jars/
-# -----------------------
-def start_jvm():
-    if not jpype.isJVMStarted():
-        jar_dir = resource_path("jars")
-        jars = [os.path.join(jar_dir, jar) for jar in os.listdir(jar_dir) if jar.endswith(".jar")]
-        if not jars:
-            raise RuntimeError("Nenhum arquivo .jar encontrado na pasta jars/")
-        jpype.startJVM(classpath=jars)
+uploaded_file = st.file_uploader("Escolha um arquivo .mdb", type=["mdb"])
 
-# -----------------------
-# Sanitize filenames
-# -----------------------
-def sanitize_filename(name):
-    return re.sub(r'[^\w\- ]', '_', str(name)).strip()
+if uploaded_file is not None:
+    # Verifica tamanho (limite de 200MB)
+    if uploaded_file.size > 200 * 1024 * 1024:
+        st.error("Arquivo muito grande. O limite é 200 MB.")
+        st.stop()
 
-def convert_java_value(value):
-    if value is None:
-        return None
-    return str(value)
+    # Salva o arquivo temporariamente
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mdb") as tmp_file:
+        tmp_file.write(uploaded_file.getbuffer())
+        mdb_path = tmp_file.name
 
-# -----------------------
-# Conversão MDB -> CSV
-# -----------------------
-def convert_mdb_to_csv(mdb_path, output_dir):
-    from com.healthmarketscience.jackcess import DatabaseBuilder
+    try:
+        # Lista tabelas com mdb-tables
+        result = subprocess.run(
+            ["mdb-tables", "-1", mdb_path],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30
+        )
+        tables = [t.strip() for t in result.stdout.split("\n") if t.strip()]
+    except subprocess.TimeoutExpired:
+        st.error("Tempo limite excedido ao ler o arquivo.")
+        st.stop()
+    except subprocess.CalledProcessError as e:
+        st.error(f"Erro ao ler o arquivo .mdb: {e.stderr}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Erro inesperado: {str(e)}")
+        st.stop()
 
-    db = DatabaseBuilder.open(jpype.java.io.File(mdb_path))
+    if not tables:
+        st.warning("Nenhuma tabela encontrada no arquivo.")
+        st.stop()
 
-    table_names = list(db.getTableNames())
+    st.success(f"Arquivo carregado! Encontradas {len(tables)} tabelas.")
 
-    for table_name in table_names:
-        table_name_py = str(table_name)
+    selected_tables = st.multiselect(
+        "Selecione as tabelas para converter (deixe vazio caso não queira converter nenhuma)",
+        options=tables,
+        default=tables
+    )
+    if not selected_tables:
+        selected_tables = tables
 
-        try:
-            table = db.getTable(table_name)
-            columns = [str(col.getName()) for col in table.getColumns()]
-            rows = []
-            for row in table:
-                row_data = [convert_java_value(row.get(col)) for col in columns]
-                rows.append(row_data)
-            df = pd.DataFrame(rows, columns=columns)
-            safe_name = sanitize_filename(table_name_py)
-            output_file = os.path.join(output_dir, f"{safe_name}.csv")
-            df.to_csv(output_file, index=False, encoding="utf-8")
-        except Exception as e:
-            if "FileNotFoundException" in str(e):
-                continue
-            else:
-                st.warning(f"Erro na tabela {table_name_py}: {e}")
+    if st.button("Converter para CSV"):
+        with st.spinner("Convertendo..."):
+            with tempfile.TemporaryDirectory() as output_dir:
+                csv_files = []
+                progress_bar = st.progress(0)
 
-    db.close()
+                for i, table in enumerate(selected_tables):
+                    safe_name = "".join(c for c in table if c.isalnum() or c in (' ', '_')).rstrip()
+                    csv_path = os.path.join(output_dir, f"{safe_name}.csv")
 
-# -----------------------
-# Interface Streamlit
-# -----------------------
-st.set_page_config(page_title="Conversor MDB → CSV", layout="centered")
-st.title("📂 Conversor MDB para CSV")
+                    try:
+                        with open(csv_path, "w") as f:
+                            subprocess.run(
+                                ["mdb-export", mdb_path, table],
+                                stdout=f,
+                                stderr=subprocess.PIPE,
+                                check=True,
+                                text=True,
+                                timeout=60
+                            )
+                        csv_files.append(csv_path)
+                    except subprocess.TimeoutExpired:
+                        st.warning(f"Tempo limite excedido na tabela '{table}'.")
+                    except subprocess.CalledProcessError as e:
+                        st.warning(f"Erro na tabela '{table}': {e.stderr}")
+                    except Exception as e:
+                        st.warning(f"Erro inesperado na tabela '{table}': {str(e)}")
 
-uploaded_file = st.file_uploader("Faça upload do arquivo .mdb", type=["mdb"])
+                    progress_bar.progress((i + 1) / len(selected_tables))
 
-if uploaded_file:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mdb_path = os.path.join(tmpdir, uploaded_file.name)
-        with open(mdb_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+                if not csv_files:
+                    st.error("Nenhuma tabela foi convertida.")
+                else:
+                    zip_path = os.path.join(tempfile.gettempdir(), "converted.zip")
+                    with zipfile.ZipFile(zip_path, "w") as zipf:
+                        for file in csv_files:
+                            zipf.write(file, arcname=os.path.basename(file))
 
-        output_dir = os.path.join(tmpdir, "csv_output")
-        os.makedirs(output_dir, exist_ok=True)
+                    with open(zip_path, "rb") as f:
+                        st.download_button(
+                            label="Baixar arquivo ZIP com os CSVs",
+                            data=f,
+                            file_name="tabelas_convertidas.zip",
+                            mime="application/zip"
+                        )
 
-        with st.spinner("Processando arquivo..."):
-            start_jvm()
-            convert_mdb_to_csv(mdb_path, output_dir)
-
-        # Criar zip com todos os CSVs
-        zip_path = os.path.join(tmpdir, "resultado.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for file in Path(output_dir).glob("*.csv"):
-                zipf.write(file, arcname=file.name)
-
-        st.success("Conversão finalizada!")
-
-        with open(zip_path, "rb") as f:
-            st.download_button(
-                label="⬇️ Baixar CSVs (ZIP)",
-                data=f,
-                file_name="csv_convertidos.zip",
-                mime="application/zip"
-            )
+    # Remove o arquivo .mdb temporário
+    os.unlink(mdb_path)
